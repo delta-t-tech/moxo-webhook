@@ -23,6 +23,7 @@ app.use(express.json());
  *   "interval":        "month",                     // optional: "day"|"week"|"month"|"year", defaults to "month"
  *   "interval_count":  1,                           // optional, defaults to 1
  *   "trial_days":      0,                           // optional, defaults to 0
+ *   "max_cycles":      12,                          // optional — stop billing after N cycles
  *   "success_url":     "https://yoursite.com/done", // optional
  *   "cancel_url":      "https://yoursite.com/cancel" // optional
  * }
@@ -52,6 +53,7 @@ app.post("/create-subscription", async (req, res) => {
       interval = "month",
       interval_count = 1,
       trial_days = 0,
+      max_cycles = null,
       success_url = process.env.DEFAULT_SUCCESS_URL || "https://example.com/success",
       cancel_url = process.env.DEFAULT_CANCEL_URL || "https://example.com/cancel",
     } = req.body;
@@ -114,10 +116,22 @@ app.post("/create-subscription", async (req, res) => {
       cancel_url,
     };
 
+    const subscriptionData = {};
+
     if (trial_days > 0) {
-      sessionParams.subscription_data = {
-        trial_period_days: trial_days,
-      };
+      subscriptionData.trial_period_days = trial_days;
+    }
+
+    if (max_cycles !== null) {
+      if (!Number.isInteger(max_cycles) || max_cycles <= 0) {
+        return res.status(400).json({ error: "max_cycles must be a positive integer" });
+      }
+      const intervalSeconds = { day: 86400, week: 604800, month: 2592000, year: 31536000 };
+      subscriptionData.cancel_at = Math.floor(Date.now() / 1000) + intervalSeconds[interval] * interval_count * max_cycles;
+    }
+
+    if (Object.keys(subscriptionData).length > 0) {
+      sessionParams.subscription_data = subscriptionData;
     }
 
     const session = await stripe.checkout.sessions.create(sessionParams);
