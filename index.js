@@ -71,24 +71,31 @@ app.post("/create-subscription", async (req, res) => {
       return res.status(400).json({ error: "initial_amount is required" });
     }
 
-    if (typeof initial_amount !== "number" || initial_amount <= 0) {
+    // Coerce numeric fields — Moxo sends all values as strings
+    const initialAmountNum = parseFloat(initial_amount);
+    const amountNum = amount !== null ? parseFloat(amount) : null;
+    const intervalCountNum = parseInt(interval_count, 10);
+    const trialDaysNum = parseInt(trial_days, 10);
+    const maxCyclesNum = max_cycles !== null ? parseInt(max_cycles, 10) : null;
+
+    if (isNaN(initialAmountNum) || initialAmountNum <= 0) {
       return res.status(400).json({ error: "initial_amount must be a positive number (in dollars)" });
     }
 
-    if (amount !== null && (typeof amount !== "number" || amount <= 0)) {
+    if (amount !== null && (isNaN(amountNum) || amountNum <= 0)) {
       return res.status(400).json({ error: "amount must be a positive number (in dollars)" });
     }
 
     // Convert dollars to cents for Stripe
-    const initialAmountCents = initial_amount !== null ? Math.round(initial_amount * 100) : null;
-    const amountCents = amount !== null ? Math.round(amount * 100) : null;
+    const initialAmountCents = initialAmountNum !== null ? Math.round(initialAmountNum * 100) : null;
+    const amountCents = amountNum !== null ? Math.round(amountNum * 100) : null;
 
     const validIntervals = ["day", "week", "month", "year"];
     if (amount !== null && !validIntervals.includes(interval)) {
       return res.status(400).json({ error: `interval must be one of: ${validIntervals.join(", ")}` });
     }
 
-    if (max_cycles !== null && (!Number.isInteger(max_cycles) || max_cycles <= 0)) {
+    if (maxCyclesNum !== null && (isNaN(maxCyclesNum) || maxCyclesNum <= 0)) {
       return res.status(400).json({ error: "max_cycles must be a positive integer" });
     }
 
@@ -115,7 +122,7 @@ app.post("/create-subscription", async (req, res) => {
         product: recurringProduct.id,
         unit_amount: amountCents,
         currency: currency.toLowerCase(),
-        recurring: { interval, interval_count },
+        recurring: { interval, interval_count: intervalCountNum },
       });
       lineItems.push({ price: recurringPrice.id, quantity: 1 });
     }
@@ -139,13 +146,13 @@ app.post("/create-subscription", async (req, res) => {
     if (amountCents !== null) {
       const subscriptionData = {};
 
-      if (trial_days > 0) {
-        subscriptionData.trial_period_days = trial_days;
+      if (trialDaysNum > 0) {
+        subscriptionData.trial_period_days = trialDaysNum;
       }
 
-      if (max_cycles !== null) {
+      if (maxCyclesNum !== null) {
         const intervalSeconds = { day: 86400, week: 604800, month: 2592000, year: 31536000 };
-        subscriptionData.cancel_at = Math.floor(Date.now() / 1000) + intervalSeconds[interval] * interval_count * max_cycles;
+        subscriptionData.cancel_at = Math.floor(Date.now() / 1000) + intervalSeconds[interval] * intervalCountNum * maxCyclesNum;
       }
 
       if (Object.keys(subscriptionData).length > 0) {
