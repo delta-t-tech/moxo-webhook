@@ -19,9 +19,8 @@ app.use(express.json());
  *   "product_name":    "Monthly Retainer",          // required
  *   "currency":        "usd",                       // optional, defaults to "usd"
  *
- *   // At least one of initial_amount or amount is required:
- *   "initial_amount":  500,                         // optional — one-time upfront payment in dollars
- *   "amount":          15,                          // optional — recurring payment in dollars
+ *   "initial_amount":  500,                         // required — deposit or pay-in-full amount in dollars
+ *   "amount":          15,                          // optional — recurring payment in dollars (omit if paying in full)
  *
  *   // Recurring only (ignored if amount not provided):
  *   "interval":        "month",                     // optional: "day"|"week"|"month"|"year", defaults to "month"
@@ -68,11 +67,11 @@ app.post("/create-subscription", async (req, res) => {
       return res.status(400).json({ error: "Missing required fields: customer_email, product_name" });
     }
 
-    if (initial_amount === null && amount === null) {
-      return res.status(400).json({ error: "At least one of initial_amount or amount is required" });
+    if (initial_amount === null) {
+      return res.status(400).json({ error: "initial_amount is required" });
     }
 
-    if (initial_amount !== null && (typeof initial_amount !== "number" || initial_amount <= 0)) {
+    if (typeof initial_amount !== "number" || initial_amount <= 0) {
       return res.status(400).json({ error: "initial_amount must be a positive number (in dollars)" });
     }
 
@@ -93,15 +92,16 @@ app.post("/create-subscription", async (req, res) => {
       return res.status(400).json({ error: "max_cycles must be a positive integer" });
     }
 
-    // 1. Create the Product
-    const product = await stripe.products.create({ name: product_name });
-
-    // 2. Build line items
+    // 1. Create separate Products and Prices for deposit and recurring
     const lineItems = [];
+    let depositProductId = null;
+    let recurringProductId = null;
 
     if (initialAmountCents !== null) {
+      const depositProduct = await stripe.products.create({ name: `${product_name} - Deposit` });
+      depositProductId = depositProduct.id;
       const oneTimePrice = await stripe.prices.create({
-        product: product.id,
+        product: depositProduct.id,
         unit_amount: initialAmountCents,
         currency: currency.toLowerCase(),
       });
@@ -109,8 +109,10 @@ app.post("/create-subscription", async (req, res) => {
     }
 
     if (amountCents !== null) {
+      const recurringProduct = await stripe.products.create({ name: product_name });
+      recurringProductId = recurringProduct.id;
       const recurringPrice = await stripe.prices.create({
-        product: product.id,
+        product: recurringProduct.id,
         unit_amount: amountCents,
         currency: currency.toLowerCase(),
         recurring: { interval, interval_count },
@@ -162,7 +164,8 @@ app.post("/create-subscription", async (req, res) => {
     return res.status(200).json({
       checkout_url: session.url,
       session_id: session.id,
-      product_id: product.id,
+      deposit_product_id: depositProductId,
+      recurring_product_id: recurringProductId,
       customer_id: customer.id,
     });
   } catch (err) {
