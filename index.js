@@ -20,8 +20,8 @@ app.use(express.json());
  *   "currency":        "usd",                       // optional, defaults to "usd"
  *
  *   // At least one of initial_amount or amount is required:
- *   "initial_amount":  50000,                       // optional — one-time upfront payment in cents
- *   "amount":          1500,                        // optional — recurring payment in cents
+ *   "initial_amount":  500,                         // optional — one-time upfront payment in dollars
+ *   "amount":          15,                          // optional — recurring payment in dollars
  *
  *   // Recurring only (ignored if amount not provided):
  *   "interval":        "month",                     // optional: "day"|"week"|"month"|"year", defaults to "month"
@@ -72,13 +72,17 @@ app.post("/create-subscription", async (req, res) => {
       return res.status(400).json({ error: "At least one of initial_amount or amount is required" });
     }
 
-    if (initial_amount !== null && (!Number.isInteger(initial_amount) || initial_amount <= 0)) {
-      return res.status(400).json({ error: "initial_amount must be a positive integer (in cents)" });
+    if (initial_amount !== null && (typeof initial_amount !== "number" || initial_amount <= 0)) {
+      return res.status(400).json({ error: "initial_amount must be a positive number (in dollars)" });
     }
 
-    if (amount !== null && (!Number.isInteger(amount) || amount <= 0)) {
-      return res.status(400).json({ error: "amount must be a positive integer (in cents)" });
+    if (amount !== null && (typeof amount !== "number" || amount <= 0)) {
+      return res.status(400).json({ error: "amount must be a positive number (in dollars)" });
     }
+
+    // Convert dollars to cents for Stripe
+    const initialAmountCents = initial_amount !== null ? Math.round(initial_amount * 100) : null;
+    const amountCents = amount !== null ? Math.round(amount * 100) : null;
 
     const validIntervals = ["day", "week", "month", "year"];
     if (amount !== null && !validIntervals.includes(interval)) {
@@ -95,19 +99,19 @@ app.post("/create-subscription", async (req, res) => {
     // 2. Build line items
     const lineItems = [];
 
-    if (initial_amount !== null) {
+    if (initialAmountCents !== null) {
       const oneTimePrice = await stripe.prices.create({
         product: product.id,
-        unit_amount: initial_amount,
+        unit_amount: initialAmountCents,
         currency: currency.toLowerCase(),
       });
       lineItems.push({ price: oneTimePrice.id, quantity: 1 });
     }
 
-    if (amount !== null) {
+    if (amountCents !== null) {
       const recurringPrice = await stripe.prices.create({
         product: product.id,
-        unit_amount: amount,
+        unit_amount: amountCents,
         currency: currency.toLowerCase(),
         recurring: { interval, interval_count },
       });
@@ -123,14 +127,14 @@ app.post("/create-subscription", async (req, res) => {
     // 4. Build Checkout Session
     // subscription mode required when any recurring item is present
     const sessionParams = {
-      mode: amount !== null ? "subscription" : "payment",
+      mode: amountCents !== null ? "subscription" : "payment",
       customer: customer.id,
       line_items: lineItems,
       success_url,
       cancel_url,
     };
 
-    if (amount !== null) {
+    if (amountCents !== null) {
       const subscriptionData = {};
 
       if (trial_days > 0) {
@@ -151,8 +155,8 @@ app.post("/create-subscription", async (req, res) => {
 
     console.log(
       `[${new Date().toISOString()}] Created checkout for ${customer_email} — ${product_name}` +
-      (initial_amount ? ` deposit:${initial_amount}` : "") +
-      (amount ? ` recurring:${amount}/${interval}` : "")
+      (initial_amount ? ` deposit:$${initial_amount}` : "") +
+      (amount ? ` recurring:$${amount}/${interval}` : "")
     );
 
     return res.status(200).json({
