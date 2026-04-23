@@ -5,7 +5,6 @@ const Stripe = require("stripe");
 const app = express();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// Webhook secret to verify requests are from Moxo
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 
 app.use(express.json());
@@ -18,12 +17,18 @@ app.use(express.json());
  *   "secret":          "your-webhook-secret",      // optional auth
  *   "customer_email":  "client@example.com",        // required
  *   "product_name":    "Monthly Retainer",          // required
- *   "amount":          1500,                        // required — in cents (e.g. 1500 = $15.00)
  *   "currency":        "usd",                       // optional, defaults to "usd"
+ *
+ *   // At least one of initial_amount or amount is required:
+ *   "initial_amount":  50000,                       // optional — one-time upfront payment in cents
+ *   "amount":          1500,                        // optional — recurring payment in cents
+ *
+ *   // Recurring only (ignored if amount not provided):
  *   "interval":        "month",                     // optional: "day"|"week"|"month"|"year", defaults to "month"
  *   "interval_count":  1,                           // optional, defaults to 1
  *   "trial_days":      0,                           // optional, defaults to 0
  *   "max_cycles":      12,                          // optional — stop billing after N cycles
+ *
  *   "success_url":     "https://yoursite.com/done", // optional
  *   "cancel_url":      "https://yoursite.com/cancel" // optional
  * }
@@ -31,13 +36,13 @@ app.use(express.json());
  * Response:
  * {
  *   "checkout_url": "https://checkout.stripe.com/...",
- *   "price_id":     "price_xxx",
- *   "product_id":   "prod_xxx"
+ *   "session_id":   "cs_xxx",
+ *   "product_id":   "prod_xxx",
+ *   "customer_id":  "cus_xxx"
  * }
  */
 app.post("/create-subscription", async (req, res) => {
   try {
-    // Verify webhook secret if configured
     if (WEBHOOK_SECRET) {
       const provided = req.body.secret || req.headers["x-webhook-secret"];
       if (provided !== WEBHOOK_SECRET) {
@@ -48,8 +53,9 @@ app.post("/create-subscription", async (req, res) => {
     const {
       customer_email,
       product_name,
-      amount,
       currency = "usd",
+      initial_amount = null,
+      amount = null,
       interval = "month",
       interval_count = 1,
       trial_days = 0,
@@ -58,92 +64,100 @@ app.post("/create-subscription", async (req, res) => {
       cancel_url = process.env.DEFAULT_CANCEL_URL || "https://example.com/cancel",
     } = req.body;
 
-    // Validate required fields
-    if (!customer_email || !product_name || !amount) {
-      return res.status(400).json({
-        error: "Missing required fields: customer_email, product_name, amount",
-      });
+    if (!customer_email || !product_name) {
+      return res.status(400).json({ error: "Missing required fields: customer_email, product_name" });
     }
 
-    if (!Number.isInteger(amount) || amount <= 0) {
-      return res.status(400).json({
-        error: "amount must be a positive integer (in cents)",
-      });
+    if (initial_amount === null && amount === null) {
+      return res.status(400).json({ error: "At least one of initial_amount or amount is required" });
+    }
+
+    if (initial_amount !== null && (!Number.isInteger(initial_amount) || initial_amount <= 0)) {
+      return res.status(400).json({ error: "initial_amount must be a positive integer (in cents)" });
+    }
+
+    if (amount !== null && (!Number.isInteger(amount) || amount <= 0)) {
+      return res.status(400).json({ error: "amount must be a positive integer (in cents)" });
     }
 
     const validIntervals = ["day", "week", "month", "year"];
-    if (!validIntervals.includes(interval)) {
-      return res.status(400).json({
-        error: `interval must be one of: ${validIntervals.join(", ")}`,
+    if (amount !== null && !validIntervals.includes(interval)) {
+      return res.status(400).json({ error: `interval must be one of: ${validIntervals.join(", ")}` });
+    }
+
+    if (max_cycles !== null && (!Number.isInteger(max_cycles) || max_cycles <= 0)) {
+      return res.status(400).json({ error: "max_cycles must be a positive integer" });
+    }
+
+    // 1. Create the Product
+    const product = await stripe.products.create({ name: product_name });
+
+    // 2. Build line items
+    const lineItems = [];
+
+    if (initial_amount !== null) {
+      const oneTimePrice = await stripe.prices.create({
+        product: product.id,
+        unit_amount: initial_amount,
+        currency: currency.toLowerCase(),
       });
+      lineItems.push({ price: oneTimePrice.id, quantity: 1 });
     }
 
-    // 1. Create the Product in Stripe
-    const product = await stripe.products.create({
-      name: product_name,
-    });
-
-    // 2. Create a recurring Price for that Product
-    const price = await stripe.prices.create({
-      product: product.id,
-      unit_amount: amount,
-      currency: currency.toLowerCase(),
-      recurring: {
-        interval,
-        interval_count,
-      },
-    });
-
-    // 3. Look up or create a Customer by email
-    const existingCustomers = await stripe.customers.list({
-      email: customer_email,
-      limit: 1,
-    });
-
-    let customer;
-    if (existingCustomers.data.length > 0) {
-      customer = existingCustomers.data[0];
-    } else {
-      customer = await stripe.customers.create({ email: customer_email });
+    if (amount !== null) {
+      const recurringPrice = await stripe.prices.create({
+        product: product.id,
+        unit_amount: amount,
+        currency: currency.toLowerCase(),
+        recurring: { interval, interval_count },
+      });
+      lineItems.push({ price: recurringPrice.id, quantity: 1 });
     }
 
-    // 4. Create a Checkout Session in subscription mode
+    // 3. Look up or create Customer
+    const existingCustomers = await stripe.customers.list({ email: customer_email, limit: 1 });
+    const customer = existingCustomers.data.length > 0
+      ? existingCustomers.data[0]
+      : await stripe.customers.create({ email: customer_email });
+
+    // 4. Build Checkout Session
+    // subscription mode required when any recurring item is present
     const sessionParams = {
-      mode: "subscription",
+      mode: amount !== null ? "subscription" : "payment",
       customer: customer.id,
-      line_items: [{ price: price.id, quantity: 1 }],
+      line_items: lineItems,
       success_url,
       cancel_url,
     };
 
-    const subscriptionData = {};
+    if (amount !== null) {
+      const subscriptionData = {};
 
-    if (trial_days > 0) {
-      subscriptionData.trial_period_days = trial_days;
-    }
-
-    if (max_cycles !== null) {
-      if (!Number.isInteger(max_cycles) || max_cycles <= 0) {
-        return res.status(400).json({ error: "max_cycles must be a positive integer" });
+      if (trial_days > 0) {
+        subscriptionData.trial_period_days = trial_days;
       }
-      const intervalSeconds = { day: 86400, week: 604800, month: 2592000, year: 31536000 };
-      subscriptionData.cancel_at = Math.floor(Date.now() / 1000) + intervalSeconds[interval] * interval_count * max_cycles;
-    }
 
-    if (Object.keys(subscriptionData).length > 0) {
-      sessionParams.subscription_data = subscriptionData;
+      if (max_cycles !== null) {
+        const intervalSeconds = { day: 86400, week: 604800, month: 2592000, year: 31536000 };
+        subscriptionData.cancel_at = Math.floor(Date.now() / 1000) + intervalSeconds[interval] * interval_count * max_cycles;
+      }
+
+      if (Object.keys(subscriptionData).length > 0) {
+        sessionParams.subscription_data = subscriptionData;
+      }
     }
 
     const session = await stripe.checkout.sessions.create(sessionParams);
 
     console.log(
-      `[${new Date().toISOString()}] Created subscription checkout for ${customer_email} — ${product_name} ${amount} ${currency}/${interval}`
+      `[${new Date().toISOString()}] Created checkout for ${customer_email} — ${product_name}` +
+      (initial_amount ? ` deposit:${initial_amount}` : "") +
+      (amount ? ` recurring:${amount}/${interval}` : "")
     );
 
     return res.status(200).json({
       checkout_url: session.url,
       session_id: session.id,
-      price_id: price.id,
       product_id: product.id,
       customer_id: customer.id,
     });
