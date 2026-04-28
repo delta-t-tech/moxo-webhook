@@ -6,7 +6,10 @@ const app = express();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 
+// Stripe webhooks require raw body for signature verification
+app.use("/stripe-webhook", express.raw({ type: "application/json" }));
 app.use(express.json());
 
 /**
@@ -36,7 +39,8 @@ app.use(express.json());
  * {
  *   "checkout_url": "https://checkout.stripe.com/...",
  *   "session_id":   "cs_xxx",
- *   "product_id":   "prod_xxx",
+ *   "deposit_product_id": "prod_xxx",
+ *   "recurring_product_id": "prod_xxx",
  *   "customer_id":  "cus_xxx"
  * }
  */
@@ -87,7 +91,7 @@ app.post("/create-subscription", async (req, res) => {
     }
 
     // Convert dollars to cents for Stripe
-    const initialAmountCents = initialAmountNum !== null ? Math.round(initialAmountNum * 100) : null;
+    const initialAmountCents = Math.round(initialAmountNum * 100);
     const amountCents = amountNum !== null ? Math.round(amountNum * 100) : null;
 
     const validIntervals = ["day", "week", "month", "year"];
@@ -104,16 +108,14 @@ app.post("/create-subscription", async (req, res) => {
     let depositProductId = null;
     let recurringProductId = null;
 
-    if (initialAmountCents !== null) {
-      const depositProduct = await stripe.products.create({ name: `${product_name} - Deposit` });
-      depositProductId = depositProduct.id;
-      const oneTimePrice = await stripe.prices.create({
-        product: depositProduct.id,
-        unit_amount: initialAmountCents,
-        currency: currency.toLowerCase(),
-      });
-      lineItems.push({ price: oneTimePrice.id, quantity: 1 });
-    }
+    const depositProduct = await stripe.products.create({ name: `${product_name} - Deposit` });
+    depositProductId = depositProduct.id;
+    const oneTimePrice = await stripe.prices.create({
+      product: depositProduct.id,
+      unit_amount: initialAmountCents,
+      currency: currency.toLowerCase(),
+    });
+    lineItems.push({ price: oneTimePrice.id, quantity: 1 });
 
     if (amountCents !== null) {
       const recurringProduct = await stripe.products.create({ name: product_name });
@@ -127,14 +129,13 @@ app.post("/create-subscription", async (req, res) => {
       lineItems.push({ price: recurringPrice.id, quantity: 1 });
     }
 
-    // 3. Look up or create Customer
+    // 2. Look up or create Customer
     const existingCustomers = await stripe.customers.list({ email: customer_email, limit: 1 });
     const customer = existingCustomers.data.length > 0
       ? existingCustomers.data[0]
       : await stripe.customers.create({ email: customer_email });
 
-    // 4. Build Checkout Session
-    // subscription mode required when any recurring item is present
+    // 3. Build Checkout Session
     const sessionParams = {
       mode: amountCents !== null ? "subscription" : "payment",
       customer: customer.id,
@@ -144,28 +145,28 @@ app.post("/create-subscription", async (req, res) => {
     };
 
     if (amountCents !== null) {
-      const subscriptionData = {};
+      const subscriptionData = { metadata: {} };
 
       if (trialDaysNum > 0) {
         subscriptionData.trial_period_days = trialDaysNum;
       }
 
+      // Store cancel_at in metadata — applied to the subscription after checkout completes
       if (maxCyclesNum !== null) {
         const intervalSeconds = { day: 86400, week: 604800, month: 2592000, year: 31536000 };
-        subscriptionData.cancel_at = Math.floor(Date.now() / 1000) + intervalSeconds[interval] * intervalCountNum * maxCyclesNum;
+        const cancelAt = Math.floor(Date.now() / 1000) + intervalSeconds[interval] * intervalCountNum * maxCyclesNum;
+        subscriptionData.metadata.cancel_at = String(cancelAt);
       }
 
-      if (Object.keys(subscriptionData).length > 0) {
-        sessionParams.subscription_data = subscriptionData;
-      }
+      sessionParams.subscription_data = subscriptionData;
     }
 
     const session = await stripe.checkout.sessions.create(sessionParams);
 
     console.log(
       `[${new Date().toISOString()}] Created checkout for ${customer_email} — ${product_name}` +
-      (initial_amount ? ` deposit:$${initial_amount}` : "") +
-      (amount ? ` recurring:$${amount}/${interval}` : "")
+      ` deposit:$${initialAmountNum}` +
+      (amountNum ? ` recurring:$${amountNum}/${interval}` : "")
     );
 
     return res.status(200).json({
@@ -184,6 +185,56 @@ app.post("/create-subscription", async (req, res) => {
 
     return res.status(500).json({ error: "Internal server error" });
   }
+});
+
+/**
+ * POST /stripe-webhook
+ *
+ * Receives events from Stripe after checkout completes.
+ * On checkout.session.completed, applies cancel_at to the subscription
+ * if max_cycles was specified when the checkout was created.
+ *
+ * Requires STRIPE_WEBHOOK_SECRET env var (from Stripe Dashboard → Webhooks).
+ */
+app.post("/stripe-webhook", async (req, res) => {
+  let event;
+
+  try {
+    if (STRIPE_WEBHOOK_SECRET) {
+      const sig = req.headers["stripe-signature"];
+      event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+    } else {
+      event = JSON.parse(req.body);
+    }
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Stripe webhook signature error:`, err.message);
+    return res.status(400).json({ error: `Webhook error: ${err.message}` });
+  }
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+
+    if (session.mode === "subscription" && session.subscription) {
+      try {
+        const subscription = await stripe.subscriptions.retrieve(session.subscription);
+        const cancelAt = subscription.metadata?.cancel_at;
+
+        if (cancelAt) {
+          await stripe.subscriptions.update(session.subscription, {
+            cancel_at: parseInt(cancelAt, 10),
+          });
+          console.log(
+            `[${new Date().toISOString()}] Set cancel_at on subscription ${session.subscription} — cancels at ${new Date(parseInt(cancelAt, 10) * 1000).toISOString()}`
+          );
+        }
+      } catch (err) {
+        console.error(`[${new Date().toISOString()}] Error setting cancel_at:`, err.message);
+        return res.status(500).json({ error: "Failed to update subscription" });
+      }
+    }
+  }
+
+  res.json({ received: true });
 });
 
 // Health check
