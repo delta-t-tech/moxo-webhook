@@ -166,7 +166,8 @@ app.post("/create-subscription", async (req, res) => {
     console.log(
       `[${new Date().toISOString()}] Created checkout for ${customer_email} — ${product_name}` +
       ` deposit:$${initialAmountNum}` +
-      (amountNum ? ` recurring:$${amountNum}/${interval}` : "")
+      (amountNum ? ` recurring:$${amountNum}/${interval}` : "") +
+      ` checkout_url:${session.url}`
     );
 
     return res.status(200).json({
